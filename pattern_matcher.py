@@ -336,24 +336,32 @@ class Chikuhouse(object):
     """
 
     CONTROL_CODE = 255
+    DELIMITERS = '{}'
 
     KNOWN_CONTROL_CODES = {
-        (0,): ['continue_text', ()],
-        (17, 1): ['new_character_text', ()],
-        (35,): ['capture_until_next_control', ('*', '*')],
-        (49,): ['capture_until_next_control', ('**', '**')],
-        (10, 0): ['capture_arguments', (2,)]
+
+        # Control codes are defined with the following metadata:
+        # Key: Output tag, search for ending tag (None if no need, else bytes for end), append newline
+
+        (0,): ['NL', None, True],
+        (17, 0): ['ClearText', None, False],
+        (1, 0): ['ResetText', None, True],
+        (35,): ['Red', (255, 32), False],
+        (10,0): ['EndDialogue', None, True],
     }
 
 
-    def __init__(self, text, table):
+    def __init__(self, text_or_bytes, table):
         """
         Chikuhouse requires the body of text you'd like to search through as well as the table mapping, since some
         control sequences return text that is translatable.
         :param text:
         """
-        assert isinstance(text, bytes)
-        self.text = text
+        self.text_or_bytes = text_or_bytes
+        if isinstance(self.text_or_bytes, bytes):
+            self.mode = 'Forward'
+        else:
+            self.mode = 'Reverse'
         self.table = table
         self.counter = 0
 
@@ -362,8 +370,16 @@ class Chikuhouse(object):
         Given some text and the position of the control code indicated, return the replacement text and the number
         of steps to advance the text counter.
         """
+        if self.mode == 'Forward':
+            return self._forward_process_control_code(counter)
+        else:
+            return self._reverse_control_code(counter)
 
-        assert self.text[counter] == self.CONTROL_CODE
+
+    def _forward_process_control_code(self, counter):
+
+        raw_bytes = self.text_or_bytes
+        assert raw_bytes[counter] == self.CONTROL_CODE
         self.counter = counter
 
         max_len = max([len(k) for k in self.KNOWN_CONTROL_CODES.keys()])
@@ -371,70 +387,39 @@ class Chikuhouse(object):
         for increment in range(1, max_len+1):
             start = counter + 1
             end = start + increment
-            control_sequence = tuple(self.text[start:end])
+            control_sequence = tuple(raw_bytes[start:end])
             try:
-                func_name, args = self.KNOWN_CONTROL_CODES[control_sequence]
-                return self.__getattribute__('_' + func_name)(*args)
+                tag_name, ending_tag, add_nl = self.KNOWN_CONTROL_CODES[control_sequence]
+                if ending_tag is None:
+                    return self.DELIMITERS[0] + tag_name + self.DELIMITERS[1] + ('\n' if add_nl else ''), 1 + increment
+                else:
+                    # Search for the ending tag
+                    ending_bytes = bytes(ending_tag)
+                    try:
+                        ending_tag_position = raw_bytes.index(ending_bytes, counter)
+                    except ValueError:
+                        print('Couldn\'t find ending tag for {}'.format(tag_name))
+                        break
+
+                    # Whatever we capture between the ending tags needs to be processed as well, so we feed it into a
+                    # BytesDecoder and try again
+                    captured_bytes = raw_bytes[end:ending_tag_position]
+                    captured_text = BytesDecoder(captured_bytes, self.table).bytes_to_text()[0]
+
+                    starting_tag = self.DELIMITERS[0] + tag_name + self.DELIMITERS[1]
+                    ending_tag = self.DELIMITERS[0] + '/' + tag_name + self.DELIMITERS[1]
+
+                    return starting_tag + captured_text + ending_tag + ('\n' if add_nl else ''), ending_tag_position + len(ending_bytes)
+
             except KeyError:
                 continue
-        else:
-            # Unknown control sequence, just return the original control code
-            return '[255]', 1
 
-    def _continue_text(self):
-        return '\n\n', 2
+        # Unknown control sequence, just return the original control code
+        return '[255]', 1
 
-    def _new_character_text(self):
-        return '\n----\n', 3
+    def _reverse_control_code(self):
+        pass
 
-    def _capture_until_next_control(self, left_delimiter, right_delimiter):
-        captured_text = []
-
-        start_point = self.counter + 2
-        for increment in range(1000):
-            byte = self.text[start_point + increment]
-            if byte == self.CONTROL_CODE:
-                text_to_return = left_delimiter + ''.join(captured_text) + right_delimiter
-                num_processed_chars = 3 + increment
-
-                return text_to_return, num_processed_chars
-            else:
-                captured_text.append(self.table.get(byte, f'[{byte}]'))
-
-        else:
-            raise ValueError('Searched for an ending control point but couldn\'t find one!')
-
-    def _capture_arguments(self, num_args):
-
-        start_point = self.counter + 3
-        end_point = start_point + num_args
-
-        captured_args = ', '.join(str(x) for x in self.text[start_point:end_point])
-        text_to_return = f'\n------NEW BOX ({captured_args})------\n'
-
-        return text_to_return, 3 + num_args
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def _load_metadata(self):
-
-        metadata_file = os.path.join(self.loader.path, self.loader.DATA_FOLDER, self.loader.METADATA_FILE)
-        try:
-            with open(metadata_file, 'r', encoding='utf-8') as fh:
-               lines = fh.readlines()
-        except FileNotFoundError:
-            return {}
 
 class BytesDecoder(object):
     """
