@@ -20,11 +20,6 @@ class Hifhif(object):
     METADATA_FILE = '__metadata.txt'
     DATA_FOLDER = 'data'
 
-    SPECIAL_CHARS = {
-        'NEWLINE': '\n',
-        'DOUBLENEWLINE': '\n\n',
-    }
-
     CONTROL_CODE = 255
 
     def __init__(self, path, load=True):
@@ -42,6 +37,8 @@ class Hifhif(object):
             self.load()
 
     def save(self):
+        raise NotImplementedError('This needs to be fixed for the multi byte characters!')
+
         table_file_lines = []
         for byte_code in sorted(self.table.keys()):
             table_file_lines.append(f'{byte_code}={self.table[byte_code]}')
@@ -60,10 +57,16 @@ class Hifhif(object):
         loaded_table = {}
         for line in table_file_lines:
             byte_code, char = line.strip('\n').split('=')[:2]
-            char = self.SPECIAL_CHARS.get(char, char)
-            byte = int(byte_code)
+            byte_sequence = [int(byte) for byte in byte_code.split(',')]
 
-            loaded_table[byte] = char
+            current_dict_reference = loaded_table
+            for seq, byte in enumerate(byte_sequence, start=1):
+                if seq == len(byte_sequence):
+                    current_dict_reference[byte] = char
+                else:
+                    if current_dict_reference.get(byte) is None:
+                        current_dict_reference[byte] = {}
+                    current_dict_reference = current_dict_reference[byte]
 
         self.table = loaded_table
 
@@ -344,10 +347,15 @@ class Chikuhouse(object):
         # Key: Output tag, search for ending tag (None if no need, else bytes for end), append newline
 
         (0,): ['NL', None, True],
-        (17, 0): ['ClearText', None, False],
         (1, 0): ['ResetText', None, True],
+        (10, 0): ['EndDialogue', None, True],
+        (11, 1): ['BoxStart', None, True],
+        (17, 0): ['ClearText', None, False],
+        (17, 1): ['UserInput', None, False],
         (35,): ['Red', (255, 32), False],
-        (10,0): ['EndDialogue', None, True],
+        (38,): ['Blue', (255, 32), False],
+        (51,): ['BigText', None, False],
+        (53,): ['CenterLine', None, False],
     }
 
 
@@ -379,8 +387,8 @@ class Chikuhouse(object):
     def _forward_process_control_code(self, counter):
 
         raw_bytes = self.text_or_bytes
+        assert isinstance(raw_bytes, bytes)
         assert raw_bytes[counter] == self.CONTROL_CODE
-        self.counter = counter
 
         max_len = max([len(k) for k in self.KNOWN_CONTROL_CODES.keys()])
 
@@ -391,6 +399,7 @@ class Chikuhouse(object):
             try:
                 tag_name, ending_tag, add_nl = self.KNOWN_CONTROL_CODES[control_sequence]
                 if ending_tag is None:
+
                     return self.DELIMITERS[0] + tag_name + self.DELIMITERS[1] + ('\n' if add_nl else ''), 1 + increment
                 else:
                     # Search for the ending tag
@@ -398,18 +407,20 @@ class Chikuhouse(object):
                     try:
                         ending_tag_position = raw_bytes.index(ending_bytes, counter)
                     except ValueError:
-                        print('Couldn\'t find ending tag for {}'.format(tag_name))
+                        # print('Couldn\'t find ending tag for {}'.format(tag_name))
                         break
 
                     # Whatever we capture between the ending tags needs to be processed as well, so we feed it into a
                     # BytesDecoder and try again
                     captured_bytes = raw_bytes[end:ending_tag_position]
-                    captured_text = BytesDecoder(captured_bytes, self.table).bytes_to_text()[0]
+                    captured_text = BytesDecoder(captured_bytes, self.table).bytes_to_text()
 
                     starting_tag = self.DELIMITERS[0] + tag_name + self.DELIMITERS[1]
                     ending_tag = self.DELIMITERS[0] + '/' + tag_name + self.DELIMITERS[1]
 
-                    return starting_tag + captured_text + ending_tag + ('\n' if add_nl else ''), ending_tag_position + len(ending_bytes)
+                    num_bytes_processed = ending_tag_position + len(ending_bytes) - counter
+
+                    return starting_tag + captured_text + ending_tag + ('\n' if add_nl else ''), num_bytes_processed
 
             except KeyError:
                 continue
@@ -417,8 +428,79 @@ class Chikuhouse(object):
         # Unknown control sequence, just return the original control code
         return '[255]', 1
 
-    def _reverse_control_code(self):
-        pass
+    def _reverse_control_code(self, counter):
+        text = self.text_or_bytes
+        assert isinstance(text, str)
+        assert text[counter] == self.DELIMITERS[0]
+
+        swapped_table = {tag_name: [control_code, ending_bytes] for control_code, (tag_name, ending_bytes, _) in self.KNOWN_CONTROL_CODES.items()}
+        try:
+            opening_tag_ending_delimiter_loc = text.index(self.DELIMITERS[1], counter)
+        except ValueError:
+            raise ValueError('Found an opening bracket with no closing bracket!')
+        tag_name = text[counter+1:opening_tag_ending_delimiter_loc]
+        try:
+            control_code, ending_bytes = swapped_table[tag_name]
+            if ending_bytes is None:
+                # Simply replace the corresponding tag with the corresponding bytes
+                return bytes([255]) + bytes(control_code), len(tag_name) + 2
+            else:
+
+                ending_tag = self.DELIMITERS[0] + '/' + tag_name + self.DELIMITERS[1]
+                ending_tag_location = text.index(ending_tag, counter)
+                captured_text = text[opening_tag_ending_delimiter_loc+1:ending_tag_location]
+                captured_bytes = TextToBytesProcessor(captured_text, self.table).convert_text_to_bytes()
+
+                starting_bytes = bytes([255]) + bytes(control_code)
+                ending_bytes = bytes(ending_bytes)
+                num_chars_processed = (len(tag_name) + 2) + len(ending_tag) + len(captured_text)
+
+                return starting_bytes + captured_bytes + ending_bytes, num_chars_processed
+        except KeyError:
+            raise ValueError('I found an unknown tag name "" in the file!'.format(tag_name))
+
+class TextToBytesProcessor(object):
+
+    LITERAL_BYTE_DELIMITERS = '[]'
+
+    def __init__(self, text, table):
+        assert isinstance(text, str)
+        self.text = text
+        self.table = table
+
+    def convert_text_to_bytes(self):
+        text = self.text
+        reverse_table = make_reverse_table(self.table)
+        control_object = Chikuhouse(self.text, self.table)
+
+        corresponding_bytes = bytes()
+        counter = 0
+
+        while counter < len(self.text):
+            char = self.text[counter]
+            if char == self.LITERAL_BYTE_DELIMITERS[0]:
+                ending_delimiter_location = text.index(self.LITERAL_BYTE_DELIMITERS[1], counter)
+                raw_text_captured = text[counter+1:ending_delimiter_location]
+
+                bytes_to_append = bytes([int(raw_text_captured)])
+                increment = len(raw_text_captured) + 2
+
+            elif char == Chikuhouse.DELIMITERS[0]:
+                bytes_to_append, increment = control_object.process_control_code(counter)
+            elif char == '\n':
+                increment = 1
+                bytes_to_append = bytes()
+            else:
+                try:
+                    bytes_to_append = reverse_table[char]
+                    increment = 1
+                except ValueError:
+                    raise ValueError('Unknown character "{}" detected in text!')
+
+            counter += increment
+            corresponding_bytes += bytes_to_append
+
+        return corresponding_bytes
 
 
 class BytesDecoder(object):
@@ -431,40 +513,10 @@ class BytesDecoder(object):
         self.bytes = raw_bytes
         self.table = table
 
-    def replace_bytes(self, replacements):
-        """
-        Replacement should be a list of (needle, replacement) tuples
-        :param replacements:
-        :return:
-        """
-        if replacements is None:
-            return
-
-        raw_bytes = self.bytes
-
-        text, correspondence_dict = self.bytes_to_text(self.bytes)
-        for needle, replacement in replacements:
-
-            position = self.find_phrase(text, needle)
-            if position is None:
-                raise ValueError(f'Wasn\'t able to locate phrase "{needle}"')
-
-            corresponding_bytes = self.find_corresponding_bytes(correspondence_dict, *position)
-            start = self.bytes.find(corresponding_bytes)
-            assert start > -1
-            end = start + len(corresponding_bytes)
-
-            new_bytes = self.translate_phrase(replacement)
-
-            raw_bytes = raw_bytes[0:start] + new_bytes + raw_bytes[end:]
-
-        return raw_bytes
-
     def bytes_to_text(self, replace_unknown=True, as_bytes=False):
         new_text_chars = []
         counter = 0
         text_len_counter = 0
-        byte_correspondence_dict = {}
         control_object = Chikuhouse(self.bytes, self.table)
 
         while counter < len(self.bytes):
@@ -476,18 +528,25 @@ class BytesDecoder(object):
             elif byte == Chikuhouse.CONTROL_CODE:
                 text_to_append, counter_increment = control_object.process_control_code(counter)
             else:
-                text_to_append = self.table.get(byte, f'[{byte}]' if replace_unknown else byte)
+
+                try:
+                    orig_byte = byte
+                    text_to_append = self.table
+                    counter_increment = 0
+                    while isinstance(text_to_append, dict):
+                        byte = self.bytes[counter + counter_increment]
+                        text_to_append = text_to_append[byte]
+                        counter_increment += 1
+                except (KeyError, IndexError):
+                    counter_increment = 1
+                    text_to_append = f'[{orig_byte}]'
 
             new_text_chars.append(text_to_append)
-
-            byte_correspondence_dict[text_len_counter] = (
-                self.bytes[counter:counter + counter_increment], text_to_append)
-
             counter += counter_increment
             text_len_counter += len(text_to_append)
 
         new_text = ''.join(new_text_chars)
-        return new_text, byte_correspondence_dict
+        return new_text
 
     def find_phrase(self, text, phrase):
         start_index = text.find(phrase)
@@ -530,14 +589,16 @@ class BytesDecoder(object):
 
 class PointerTableDecoder(object):
 
+    DELIMITER = '---- POINTER TABLE: '
+    ENDING_DELIMITER = '---- END POINTER TABLE: '
+    POINTER_INDICATOR = '-- Pointer: '
+
     def __init__(self, raw_bytes, table, offset=0, metadata=None, include_endpoints = False, **kwargs):
         self.bytes = raw_bytes
         self.table = table
         self.offset = offset
         self.pointer_map = {}
         self.include_endpoints = include_endpoints
-
-        self.DELIMITER = f'---- POINTER TABLE ({offset}) ----'
 
         if metadata is None:
             metadata = {}
@@ -556,30 +617,45 @@ class PointerTableDecoder(object):
 
             self.pointer_map[start] = decoder_class(self.bytes[start:end], table, **kwargs)
 
-    def replace_bytes(self, replacement_dict):
-        if replacement_dict is None:
-            return self.bytes
 
-        pointers = []
+
+    def bytes_to_text(self, replace_unknown=True, as_bytes=False):
+        text = self.DELIMITER + str(self.offset) + '\n'
         all_pointers = sorted(self.pointer_map.keys())
 
-        byte_output = bytes()
+        for pointer in all_pointers:
 
-        base_offset = len(all_pointers) * 4     # Implicit hardcode
+            absolute_pointer = self.offset + pointer
+            text += self.POINTER_INDICATOR + str(absolute_pointer) + '\n'
+            text += self.pointer_map[pointer].bytes_to_text(replace_unknown=replace_unknown, as_bytes=as_bytes)
+            text += '\n\n'
+
+        text += self.ENDING_DELIMITER + str(self.offset) + '\n'
+        return text
+
+    @classmethod
+    def construct_new_table(cls, replacement_data, table, include_endpoints=False):
+
+        # Replacement data
+        pointer_info = cls.parse_replacement_data(replacement_data)
+
+        pointers = []
+        all_pointers = sorted(pointer_info)
+
+        byte_output = bytes()
+        base_offset = len(all_pointers) * 4  # Implicit hardcode
 
         current_offset = 0
         for pointer in all_pointers:
 
-            absolute_pointer = self.offset + pointer
-            pointers.append(base_offset + current_offset)
-
-            decoder_object = self.pointer_map[pointer]
-            if isinstance(decoder_object, BytesDecoder):
-                replacements = replacement_dict.get(absolute_pointer, [])
+            data_to_convert = pointer_info[pointer]
+            if isinstance(data_to_convert, dict):
+                bytes_to_append = PointerTableDecoder.construct_new_table(data_to_convert, table,
+                                                                          include_endpoints=True)
             else:
-                replacements = replacement_dict
+                bytes_to_append = TextToBytesProcessor(data_to_convert, table=table).convert_text_to_bytes()
 
-            bytes_to_append = decoder_object.replace_bytes(replacements)
+            pointers.append(base_offset + current_offset)
 
             byte_output += bytes_to_append
             current_offset += len(bytes_to_append)
@@ -587,24 +663,59 @@ class PointerTableDecoder(object):
         new_bytes = reconstruct_pointer_table(pointers) + byte_output
         new_bytes += bytes([0]) * ((4 - len(new_bytes) % 4) % 4)
 
-        if self.include_endpoints:
+        if include_endpoints:
             new_bytes = struct.pack('<I', 8) + struct.pack('<I', len(new_bytes) + 8) + new_bytes
-
-
 
         return new_bytes
 
-    def bytes_to_text(self, replace_unknown=True, as_bytes=False):
-        text = self.DELIMITER + '\n'
-        all_pointers = sorted(self.pointer_map.keys())
 
-        for pointer in all_pointers:
+    @classmethod
+    def parse_replacement_data(cls, replacement_data):
 
-            absolute_pointer = self.offset + pointer
-            text += f'Pointer: {absolute_pointer}\n'
-            text += self.pointer_map[pointer].bytes_to_text(replace_unknown=replace_unknown, as_bytes=as_bytes)[0]
-            text += '\n\n'
-        return text, None
+
+        # Replacement data is a text stream from the .rpl file which is output from bytes_to_text.
+        if isinstance(replacement_data, dict):
+            return replacement_data
+
+
+        rez = {}
+
+        if isinstance(replacement_data, str):
+            all_lines = replacement_data.split('\n')
+        else:
+            all_lines = replacement_data
+
+        current_line = 0
+        current_pointer = None
+
+        while current_line < len(all_lines):
+            line = all_lines[current_line].strip('\n')
+            if not line or line.startswith('#'):
+                current_line += 1
+                continue
+
+            if line.startswith(cls.DELIMITER):
+                argument = int(line.replace(cls.DELIMITER, ''))
+                ending_line = cls.ENDING_DELIMITER + str(argument)
+                ending_line_location = all_lines.index(ending_line)
+                rez[argument] = cls.parse_replacement_data(all_lines[current_line + 1:ending_line_location])
+
+                current_line = ending_line_location + 1
+
+            elif line.startswith(cls.POINTER_INDICATOR):
+                argument = int(line.replace(cls.POINTER_INDICATOR, ''))
+                current_pointer = argument
+                rez[current_pointer] = ''
+
+                current_line += 1
+            else:
+                rez[current_pointer] += line
+                current_line += 1
+
+        if 0 in rez:
+            return rez[0]
+        return rez
+
 
 
 class FileDecoder(object):
@@ -628,20 +739,25 @@ class FileDecoder(object):
         self.decoders[file_name] = PointerTableDecoder(raw_bytes, self.table, metadata=self.metadata[file_name])
         self.current_file = file_name
 
-    def bytes_to_text(self, replace_unknown=True, as_bytes=False):
-        text = self.decoders[self.current_file].bytes_to_text(replace_unknown=replace_unknown, as_bytes=as_bytes)[0]
+    def bytes_to_text(self, replace_unknown=True, as_bytes=False, output_rpl = False):
+        text = self.decoders[self.current_file].bytes_to_text(replace_unknown=replace_unknown, as_bytes=as_bytes)
         suffix = '{}.txt'.format('.bytes' if as_bytes else '')
         output_file_name = os.path.join(self.loader.path, self.loader.DATA_FOLDER, self.current_file + suffix)
         with open(output_file_name, 'w', encoding='utf-8') as fh:
             fh.write(text)
 
+        if output_rpl:
+            rpl_file_name = output_file_name.replace('.txt', '.rpl')
+            with open(rpl_file_name, 'w', encoding='utf-8') as fh:
+                fh.write(text)
+
         print(f'Output to: {output_file_name}')
 
-    def replace_and_save(self, file_name = None):
+    def load_from_replacement_file(self, file_name = None):
         file_name = file_name or self.current_file
         new_file_name = os.path.join(self.loader.path, self.loader.DATA_FOLDER, 'RECONSTRUCTED_' + self.current_file)
         with open(new_file_name, 'wb') as fh:
-            fh.write(self.decoders[file_name].replace_bytes(self._load_replacement_data()))
+            fh.write(self.decoders[file_name].construct_new_table(self._load_replacement_data(), self.table))
         print(f'Output to: {new_file_name}')
 
 
@@ -670,25 +786,19 @@ class FileDecoder(object):
         rpl_file_name = os.path.join(self.loader.path, self.loader.DATA_FOLDER, file_name + '.rpl')
         try:
             with open(rpl_file_name, 'r', encoding='utf-8') as fh:
-                lines = fh.readlines()
+                text = fh.read()
         except FileNotFoundError:
             print('No replacement data found for file: ' + rpl_file_name)
             return {}
 
-        substitutions = defaultdict(list)
-        current_pointer = None
-        for line in lines:
-            line = line.strip()
-            if line.startswith('#'):
-                continue
-            if line.startswith('!'):
-                current_pointer = int(line[1:])
-                continue
-            if '|' in line:
-                needle, replacement = line.split('|')
-                substitutions[current_pointer].append((needle, replacement))
+        return text
 
-        return substitutions
+    def search_for_text(self, phrase):
+        for file_name in self.loader.files:
+            self.open(file_name)
+            text = self.decoders[file_name].bytes_to_text()
+            if phrase in text:
+                print(f'Found {phrase} in {file_name}')
 
 
 def parse_pointer_table(raw_bytes):
@@ -713,3 +823,21 @@ def reconstruct_pointer_table(pointers, format_code='<I', offset=0):
         raw_bytes += struct.pack(format_code, pointer + offset)
 
     return raw_bytes
+
+
+def make_reverse_table(table):
+
+    # Returns a dictionary indexed by a text character, with the byte values to append
+    rez = {}
+    for key, val in table.items():
+
+        if not isinstance(val, dict):
+            rez[val] = bytes([key])
+            continue
+
+        subtable = make_reverse_table(table[key])
+        for text_char, byte_seq in subtable.items():
+            rez[text_char] = bytes([key]) + byte_seq
+
+    return rez
+
