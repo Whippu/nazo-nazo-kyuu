@@ -146,10 +146,10 @@ class PointerTableDecoder(object):
                 if end is not None:
                     end += 8
 
-            decoder_class = metadata.get(start + offset, BytesDecoder)
+            decoder_class = metadata.get(start + offset, metadata.get('Default', BytesDecoder))
             kwargs = {}
-            if decoder_class is PointerTableDecoder:
-                kwargs = dict(offset=start, include_endpoints=True)
+            if issubclass(decoder_class, PointerTableDecoder):
+                kwargs = dict(offset=start)
 
             self.pointer_map[start] = decoder_class(self.bytes[start:end], table, **kwargs)
 
@@ -167,11 +167,10 @@ class PointerTableDecoder(object):
         text += self.ENDING_DELIMITER + str(self.offset) + '\n'
         return text
 
-    @classmethod
-    def construct_new_table(cls, replacement_data, table, include_endpoints=False):
+    def construct_new_table(self, replacement_data):
 
         # Replacement data
-        pointer_info = cls.parse_replacement_data(replacement_data)
+        pointer_info = self.parse_replacement_data(replacement_data)
 
         pointers = []
         all_pointers = sorted(pointer_info)
@@ -183,11 +182,16 @@ class PointerTableDecoder(object):
         for pointer in all_pointers:
 
             data_to_convert = pointer_info[pointer]
-            if isinstance(data_to_convert, dict):
-                bytes_to_append = PointerTableDecoder.construct_new_table(data_to_convert, table,
-                                                                          include_endpoints=True)
+            corresponding_decoder = self.pointer_map[pointer - self.offset]
+
+            if isinstance(corresponding_decoder, PointerTableDecoder):
+                # Note! Implicit assumption here we only ever go 2 pointer tables deep. If need more, check how to
+                # pass in metadata
+                new_decoder = PointerTableDecoder(corresponding_decoder.bytes, self.table, corresponding_decoder.offset,
+                                                  include_endpoints=corresponding_decoder.include_endpoints)
+                bytes_to_append = new_decoder.construct_new_table(data_to_convert)
             else:
-                bytes_to_append = TextToBytesProcessor(data_to_convert, table=table).convert_text_to_bytes()
+                bytes_to_append = TextToBytesProcessor(data_to_convert, table=self.table).convert_text_to_bytes()
 
             pointers.append(base_offset + current_offset)
 
@@ -197,7 +201,7 @@ class PointerTableDecoder(object):
         new_bytes = reconstruct_pointer_table(pointers) + byte_output
         new_bytes += bytes([0]) * ((4 - len(new_bytes) % 4) % 4)
 
-        if include_endpoints:
+        if self.include_endpoints:
             new_bytes = struct.pack('<I', 8) + struct.pack('<I', len(new_bytes) + 8) + new_bytes
 
         return new_bytes
@@ -247,13 +251,18 @@ class PointerTableDecoder(object):
             return rez[0]
         return rez
 
+class PointerTableDecoderWithEndpoints(PointerTableDecoder):
+    def __init__(self, *args, **kwargs):
+        kwargs['include_endpoints'] = True
+        super(PointerTableDecoderWithEndpoints, self).__init__(*args, **kwargs)
 
 
 class FileDecoder(object):
 
     DECODER_MAP = {
-        'PointerTable': PointerTableDecoder,
-        'Bytes': BytesDecoder
+        'PointerTableEndpoints': PointerTableDecoderWithEndpoints,
+        'PointerTableNoEndpoints': PointerTableDecoder,
+        'Bytes': BytesDecoder,
     }
 
     def __init__(self, path):
@@ -288,7 +297,7 @@ class FileDecoder(object):
         file_name = file_name or self.current_file
         new_file_name = os.path.join(self.loader.path, self.loader.DATA_FOLDER, 'RECONSTRUCTED_' + self.current_file)
         with open(new_file_name, 'wb') as fh:
-            fh.write(self.decoders[file_name].construct_new_table(self._load_replacement_data(), self.table))
+            fh.write(self.decoders[file_name].construct_new_table(self._load_replacement_data()))
         print(f'Output to: {new_file_name}')
 
 
@@ -303,7 +312,13 @@ class FileDecoder(object):
             if line.startswith('#'):
                 continue
             if line.startswith('!'):
-                current_file = line[1:]
+                current_file = line.split(':')[0][1:]
+                if ':' in line:
+                    decoder_class = line.split(':')[1]
+                    self.metadata[current_file]['Default'] = self.DECODER_MAP[decoder_class]
+                else:
+                    self.metadata[current_file]['Default'] = BytesDecoder
+
                 continue
             if ':' in line:
                 pointer, decoder_class = line.split(':')
