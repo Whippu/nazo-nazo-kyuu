@@ -140,6 +140,8 @@ class PointerTableDecoder(object):
             metadata = {}
 
         pointers = parse_pointer_table(raw_bytes[8 if include_endpoints else 0:])
+
+        self.orig_pointers = pointers  # Need this to keep track of duplicates!
         for start, end in zip(pointers, pointers[1:] + [None]):
             if include_endpoints:
                 start += 8
@@ -173,14 +175,21 @@ class PointerTableDecoder(object):
         pointer_info = self.parse_replacement_data(replacement_data)
 
         pointers = []
-        all_pointers = sorted(pointer_info)
+        all_pointers = self.orig_pointers
 
         byte_output = bytes()
         base_offset = len(all_pointers) * 4  # Implicit hardcode
 
         current_offset = 0
-        for pointer in all_pointers:
 
+        has_been_processed = {}
+        for pointer in self.orig_pointers:
+
+            if has_been_processed.get(pointer):
+                pointers.append(has_been_processed[pointer])
+                continue
+
+            pointer = pointer + self.offset + (8 if self.include_endpoints else 0)
             data_to_convert = pointer_info[pointer]
             corresponding_decoder = self.pointer_map[pointer - self.offset]
 
@@ -194,9 +203,12 @@ class PointerTableDecoder(object):
                 bytes_to_append = TextToBytesProcessor(data_to_convert, table=self.table).convert_text_to_bytes()
 
             pointers.append(base_offset + current_offset)
+            has_been_processed[pointer] = base_offset + current_offset
 
             byte_output += bytes_to_append
             current_offset += len(bytes_to_append)
+
+
 
         new_bytes = reconstruct_pointer_table(pointers) + byte_output
         new_bytes += bytes([0]) * ((4 - len(new_bytes) % 4) % 4)
@@ -224,8 +236,8 @@ class PointerTableDecoder(object):
         current_pointer = None
 
         while current_line < len(all_lines):
-            line = all_lines[current_line].strip('\n')
-            if not line or line.startswith('#'):
+            line = all_lines[current_line].strip('\n').split('#')[0]
+            if not line:
                 current_line += 1
                 continue
 
@@ -359,16 +371,17 @@ class Chikuhouse(object):
         # Control codes are defined with the following metadata:
         # Key: Output tag, search for ending tag (None if no need, else bytes for end), append newline
 
-        (0,): ['NL', None, True],
-        (1, 0): ['ResetText', None, True],
-        (10, 0): ['EndDialogue', None, True],
-        (11, 1): ['BoxStart', None, True],
-        (17, 0): ['ClearText', None, False],
-        (17, 1): ['UserInput', None, False],
-        (35,): ['Red', (255, 32), False],
-        (38,): ['Blue', (255, 32), False],
-        (51,): ['BigText', None, False],
-        (53,): ['CenterLine', None, False],
+        (0,): ['NL', None, True, 0],
+        (1, 0): ['ResetText', None, True, 0],
+        (10, 0): ['EndDialogue', None, True, 0],
+        (11, 1): ['BoxStart', None, True, 0],
+        (12,): ['Pause', None, False, 1],
+        (17, 0): ['ClearText', None, False, 0],
+        (17, 1): ['UserInput', None, False, 0],
+        (35,): ['Red', (255, 32), False, 0],
+        (38,): ['Blue', (255, 32), False, 0],
+        (51,): ['BigText', None, False, 0],
+        (53,): ['CenterLine', None, False, 0],
     }
 
     def __init__(self, text_or_bytes, table):
@@ -409,11 +422,21 @@ class Chikuhouse(object):
             end = start + increment
             control_sequence = tuple(raw_bytes[start:end])
             try:
-                tag_name, ending_tag, add_nl = self.KNOWN_CONTROL_CODES[control_sequence]
+                tag_name, ending_tag, add_nl, args = self.KNOWN_CONTROL_CODES[control_sequence]
                 if ending_tag is None:
 
-                    return self.DELIMITERS[0] + tag_name + self.DELIMITERS[1] + ('\n' if add_nl else ''), 1 + increment
+                    arg_str = ''
+                    if args:
+                        captured_args = [hex_str(x) for x in raw_bytes[end:end+args]]
+
+                        arg_str = '|' + ','.join(captured_args)
+
+                    return self.DELIMITERS[0] + tag_name + arg_str + self.DELIMITERS[1] + ('\n' if add_nl else ''), \
+                           1 + increment + args
                 else:
+                    if args:
+                        raise NotImplementedError('Assumed all control codes with arguments do not have ending tags')
+
                     # Search for the ending tag
                     ending_bytes = bytes(ending_tag)
                     try:
@@ -445,18 +468,30 @@ class Chikuhouse(object):
         assert isinstance(text, str)
         assert text[counter] == self.DELIMITERS[0]
 
-        swapped_table = {tag_name: [control_code, ending_bytes] for control_code, (tag_name, ending_bytes, _) in self.KNOWN_CONTROL_CODES.items()}
+        swapped_table = {tag_name: [control_code, ending_bytes, args] for control_code, (tag_name, ending_bytes, _, args) in self.KNOWN_CONTROL_CODES.items()}
         try:
             opening_tag_ending_delimiter_loc = text.index(self.DELIMITERS[1], counter)
         except ValueError:
             raise ValueError('Found an opening bracket with no closing bracket!')
         tag_name = text[counter+1:opening_tag_ending_delimiter_loc]
+        orig_tag_len = len(tag_name)
+
+        captured_args = bytes()
+        if '|' in tag_name:
+            tag_name, captured_args = tag_name.split('|')
+            captured_args = bytes([int(x, 16) for x in captured_args.split(',')])
+
         try:
-            control_code, ending_bytes = swapped_table[tag_name]
+            control_code, ending_bytes, args = swapped_table[tag_name]
+            if len(captured_args) != args:
+                raise ValueError(f'Incorrect args for {tag_name}, expected {args} args but got {len(captured_args)}')
+
             if ending_bytes is None:
                 # Simply replace the corresponding tag with the corresponding bytes
-                return bytes([255]) + bytes(control_code), len(tag_name) + 2
+                return bytes([255]) + bytes(control_code) + captured_args, orig_tag_len + 2  # Everything inside braces + 2 surrounding braces
             else:
+                if args:
+                    raise NotImplementedError('Assumed all control codes with arguments do not have ending tags')
 
                 ending_tag = self.DELIMITERS[0] + '/' + tag_name + self.DELIMITERS[1]
                 ending_tag_location = text.index(ending_tag, counter)
