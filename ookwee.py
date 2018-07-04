@@ -5,8 +5,9 @@ import os
 import pickle
 from itertools import product
 import struct
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from functools import partial
+import csv
 
 """
 # Some example code here to get you started!
@@ -41,6 +42,7 @@ class BytesDecoder(object):
         control_object = Chikuhouse(self.bytes, self.table)
 
         while counter < len(self.bytes):
+
             counter_increment = 1
             byte = self.bytes[counter]
 
@@ -168,6 +170,181 @@ class PointerTableDecoder(object):
 
         text += self.ENDING_DELIMITER + str(self.offset) + '\n'
         return text
+
+    def bytes_to_csv_dict(self, max_len=1000):
+        text = self.bytes_to_text()
+
+        entries = defaultdict(dict)
+
+        current_pointer = None
+
+        current_text_elems = []
+        for line in text.split('\n'):
+            if not line:
+                continue
+
+            if line.startswith(self.DELIMITER):
+                continue
+
+            if line.startswith(self.ENDING_DELIMITER):
+                continue
+
+            if line.startswith(self.POINTER_INDICATOR):
+                self.process_text_for_csv(entries, current_pointer, current_text_elems,
+                                          max_len=max_len)
+                current_pointer = int(line.replace(self.POINTER_INDICATOR, ''))
+                current_text_elems = []
+                continue
+            current_text_elems.append(line)
+        else:
+            self.process_text_for_csv(entries, current_pointer, current_text_elems,
+                                      max_len=max_len)
+
+        return entries
+
+    def process_text_for_csv(self, results_dict, current_pointer, text_elems, max_len=1000):
+        info = {}
+        if current_pointer is None:
+            return
+
+        text = ''.join(map(lambda x: x.split('#')[0], text_elems))
+        if len(text) > max_len or '{EndDialogue}' not in text:
+            info['text'] = '[Unknown data]'
+            results_dict[current_pointer] = info
+            return
+
+        if not len(text):
+            info['text'] = '[Empty]'
+            results_dict[current_pointer] = info
+            return
+
+        metadata = {}
+
+        # Process out the first two args and turn them into a raw form
+        reverse_table = make_reverse_table(self.table)
+        width_arg = ord(reverse_table[text[0]])
+        height_arg = ord(reverse_table[text[1]])
+        num_lines = (height_arg - 1) // 2
+        text = text[2:]
+
+        metadata['width'] = width_arg
+        metadata['num_lines'] = num_lines
+
+        # If there's anything after the EndDialogue box that's not a padding symbol, take note of it
+        text, additional = text.split('{EndDialogue}', maxsplit=1)
+        if additional.replace('[0]', ''):
+            raise ValueError('I found something after the EndDialogue that was not padding! Take a look at it!')
+
+        # Do we have user input for this box?
+        user_input = '{UserInput}' in text
+        metadata['user_input'] = int(user_input)
+        if user_input:
+            text = text.replace('{ClearText}{ResetText}', '\n').replace('{UserInput}', '')
+        else:
+            text = text.replace('{ResetText}', '\n')
+
+        # Is there a leading BoxStart in the text? Sometimes they are there and sometimes they aren't...
+        leading_boxstart = text.startswith('{BoxStart}')
+        metadata['leading_boxstart'] = int(leading_boxstart)
+        text = text.replace('{BoxStart}', '')
+
+        # Process out all NLs
+        text = text.replace('{NL}', '\n')
+
+        info['text'] = text
+        metadata_keys = sorted(metadata.keys())
+        info['metadata'] = '\n'.join((f'{k}={metadata[k]}' for k in metadata_keys))
+
+        results_dict[current_pointer] = info
+
+    def csv_dictionary_to_bytes(self, csv_dict, use_col='text'):
+        pointers = sorted(csv_dict.keys())
+        replacement_data = {}
+
+        existing_pointer_structure = sorted(self.pointer_map.keys())
+        current_parent = None
+
+        for pointer in pointers:
+
+            if pointer in existing_pointer_structure:
+                current_parent = pointer
+                if isinstance(self.pointer_map[current_parent], PointerTableDecoder):
+                    replacement_data[pointer] = {}
+                    continue
+                else:
+                    current_parent = None
+
+            # Some logic to find the decoder corresponding to the original text
+            if current_parent is None:
+                decoder = self.pointer_map[pointer]
+            else:
+                parent_decoder = self.pointer_map[current_parent]
+                relative_pointer = pointer - parent_decoder.offset
+                decoder = parent_decoder.pointer_map[relative_pointer]
+
+            text = csv_dict[pointer][use_col]
+            if not text or text == '[Unknown data]':
+                # If we don't want to bother, we grab the text from the original pointer
+                new_text = decoder.bytes_to_text()
+
+            else:
+                # Otherwise we process the text from the text cell
+                metadata = {kv_pair[0]: int(kv_pair[1]) for kv_pair in map(lambda kv: kv.split('='), csv_dict[pointer]['metadata'].split('\n'))}
+                if csv_dict[pointer].get('overrides'):
+                    metadata.update({kv_pair[0]: int(kv_pair[1]) for kv_pair in map(lambda kv: kv.split('='), csv_dict[pointer]['overrides'].split('\n'))})
+
+                leading_boxstart = metadata['leading_boxstart']
+                width = metadata['width']
+                num_lines = metadata['num_lines']
+                user_input = metadata['user_input']
+
+                text_elems = text.split('\n')
+                # Deal with some weird corner cases
+                if (len(text_elems) == num_lines + 1) and not text_elems[-1]:
+                    text_elems[num_lines - 1] += '{NL}'
+                    del text_elems[num_lines]
+
+                modified_lines = []
+                for line_num, line in enumerate(text_elems, start=1):
+                    if line_num % num_lines == 0 or line_num == len(text_elems):
+                        # If we're on the last line, we need to add the EndDialogue (and UserInput if it's user)
+                        # If it's not the last line, we instead add the ResetText (and ClearText if it's user)
+                        if line_num == len(text_elems):
+                            if user_input:
+                                line += '{UserInput}'
+                            line += '{EndDialogue}'
+                        else:
+                            if user_input:
+                                line += '{ClearText}'
+                            line += '{ResetText}'
+
+                    elif line_num % num_lines == 1:
+                        # We need to append boxstarts to the beginning of each N-line section
+                        if not (line_num == 1 and not leading_boxstart):
+                            line = '{BoxStart}' + line
+                        line += '{NL}'
+
+
+                    else:
+                        line += '{NL}'
+
+                    modified_lines.append(line)
+
+                new_text = self.table[width] + self.table[num_lines * 2 + 1] + ''.join(modified_lines)
+                pdb.set_trace()
+
+            # old_text = decoder.bytes_to_text()
+            # old_text = ''.join((x.split('#')[0] for x in old_text.split('\n')))
+            #
+            # new_text = ''.join((x.split('#')[0] for x in new_text.split('\n')))
+
+            if current_parent is None:
+                replacement_data[pointer] = new_text
+
+            else:
+                replacement_data[current_parent][pointer] = new_text
+
+        return self.construct_new_table(replacement_data)
 
     def construct_new_table(self, replacement_data):
 
@@ -305,11 +482,53 @@ class FileDecoder(object):
 
         print(f'Output to: {output_file_name}')
 
+    def bytes_to_csv(self, max_len=1000):
+        csv_dict = self.decoders[self.current_file].bytes_to_csv_dict(max_len=max_len)
+        pointers = sorted(csv_dict.keys())
+        file_path = os.path.join(self.loader.path, self.loader.DATA_FOLDER, self.current_file + '.csv')
+
+        all_cols = ['metadata', 'text']
+
+        with open(file_path, 'w', newline='', encoding='utf-8') as fh:
+            writer = csv.writer(fh, delimiter=',')
+            writer.writerow(['Pointer'] + all_cols)
+            for pointer in pointers:
+                writer.writerow([pointer] + [csv_dict[pointer].get(col, '') for col in all_cols])
+
+
+
+
     def load_from_replacement_file(self, file_name = None):
         file_name = file_name or self.current_file
         new_file_name = os.path.join(self.loader.path, self.loader.DATA_FOLDER, 'RECONSTRUCTED_' + self.current_file)
         with open(new_file_name, 'wb') as fh:
             fh.write(self.decoders[file_name].construct_new_table(self._load_replacement_data()))
+        print(f'Output to: {new_file_name}')
+
+    def load_from_csv_file(self, use_col='text'):
+        csv_file = os.path.join(self.loader.path, self.loader.DATA_FOLDER, self.current_file + '.csv')
+        reconstructed_dict = {}
+        with open(csv_file, 'r', encoding='utf-8') as fh:
+            reader = csv.reader(fh)
+            header = None
+
+            for row in reader:
+                if header is None:
+                    header = row
+                    continue
+                current_row_dict = {}
+                pointer = int(row[0])
+                for col, val in zip(header[1:], row[1:]):
+                    if val.isnumeric():
+                        val = int(val)
+                    current_row_dict[col] = val
+
+                reconstructed_dict[pointer] = current_row_dict
+
+        new_bytes = self.decoders[self.current_file].csv_dictionary_to_bytes(reconstructed_dict, use_col=use_col)
+        new_file_name = os.path.join(self.loader.path, self.loader.DATA_FOLDER, 'CSV_RECONSTRUCTED_' + self.current_file)
+        with open(new_file_name, 'wb') as fh:
+            fh.write(new_bytes)
         print(f'Output to: {new_file_name}')
 
 
@@ -374,7 +593,7 @@ class Chikuhouse(object):
         (0,): ['NL', None, True, 0],
         (1, 0): ['ResetText', None, True, 0],
         (10, 0): ['EndDialogue', None, True, 0],
-        (11, 1): ['BoxStart', None, True, 0],
+        (11, 1): ['BoxStart', None, False, 0],
         (12,): ['Pause', None, False, 1],
         (17, 0): ['ClearText', None, False, 0],
         (17, 1): ['UserInput', None, False, 0],
